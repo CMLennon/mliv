@@ -1,0 +1,156 @@
+---
+title: "BelloniDataRmarkdown"
+author: "Connor Lennon"
+date: "8/15/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Some notes about the simulation
+
+
+
+```{r packages preload}
+#let's load up our toolkit  
+options(stringsAsFactors = F)
+  # Packages
+  library(pacman)
+p_unload(plotly)  
+p_load(
+    ggplot2, tidymodels, e1071, ggthemes, latex2exp, Cairo,
+    party, estimatr, lfe,
+    tidyverse, haven, data.table, lubridate, magrittr, parallel, parsnip, glmnet, doParallel, MASS
+  )
+```
+
+## Simulate the data
+
+This time, we need to test with a very large number of variables over a variety of lambdas. To do this, let's build a couple of working paramaters
+```{r pressure, echo=FALSE}
+#set simulation seed
+set.seed(42)
+
+#number of observations
+n1 = 100
+n2 = 250
+n3 = 500
+
+#number of variables
+k = 100
+
+#number of parameters
+#set up names
+z_names = NULL
+X_names = NULL
+V_names = NULL
+for (h in 1:k) {
+  z_names[h] = paste0('z', as.character(h))
+  X_names[h] = paste0('X', as.character(h))
+  V_names[h] = paste0('V', as.character(h))
+}
+#generate data, set names
+  
+#using Belloni method, generate pi and beta values (according to page 26 of Belloni: SPARSE MODELS AND METHODS FOR OPTIMAL INSTRUMENTS WITH AN APPLICATION TO EMINENT DOMAIN
+)
+pi_val_base =  .7
+pi_vector = rep(0:(k-1))
+pi_vals = NULL
+for (j in beta_vector) {
+  pi_vals[j] = pi_val_base^pi_vector[j]
+  }
+
+true_beta = 1
+
+
+#Generate two errors according to Bellloni (pg 26)
+
+#first need covariance and variamce set, to produce covar matrix
+var_er = 1
+cor_er = .6
+var_inst = 1
+
+#produce Sigma Z. variance is 1, correlation (thus cov) is equal to .5^(|j-h|) for z_j and z_h
+Sig_z = matrix(0,k,k)
+for (j in (1:k)) {
+  for (h in (1:k)) {
+  Sig_z[c(j),c(h)] = .5^abs(j-h)
+  }
+}
+View(Sig_z)
+
+z_n1 = mvrnorm(n = n1, mu = rep(0,k), Sigma = Sig_z, empirical = TRUE)
+z_n2 = mvrnorm(n = n2, mu = rep(0,k), Sigma = Sig_z, empirical = TRUE)
+z_n3 = mvrnorm(n=n3, mu = rep(0,k), Sigma = Sig_z, empirical = TRUE)
+
+#using exponential
+beta_pattern <-  unlist(lapply(c(0:(k-1)), function(x) (.7)^x), use.names = FALSE)
+
+Sig_z <- as.matrix(Sig_z)
+beta_pattern <- as.vector(beta_pattern)
+View(Sig_z)
+View(beta_pattern)
+```
+
+The concentration parameter is defined by $\frac{nC^2\Pi \Sigma_Z \ Pi}{1-C^2(\Pi \Sigma \ Pi)} = \mu^2$. Solving for C, we can find
+
+$$C = \sqrt{\frac{\mu^2}{n+\mu^2(\Pi \Sigma \ Pi)}$$
+
+We can use this to generate different concentrations on our betas to produce different behaviors in our IV estimators. Belloni et al. use 30 and 180 as two target $\mu^2$ values. We will use their selected values
+
+```{r}
+set_C <- function(musq) {
+  C = sqrt(musq/((n+musq)*(crossprod(beta_pattern,Sig_z) %*% beta_pattern)))
+  return(C)
+}
+
+C = set_C(180)
+
+#now that C is known, set variance for error term on X
+sigma_v = 1 - C*crossprod(beta_pattern,Sig_z) %*% beta_pattern
+sigma_v
+#We can also set our full pi matrix to find our true instrument coefficients
+betas <- C*beta_pattern
+```
+
+now that $\sigma^2_v$ is known, we can now generate our error structure, along with our vector of $z$, which then gives us freedom to compute $y$ and $x$
+
+```{r}
+#We now need to solve for cov(v,e) when only knowing corr(v,e). This boils down to corr(v,e)*sqrt(sigma_v) = cov(v,e)
+
+cov_er<-cor_er*sqrt(sigma_v)
+
+#use multivariate distribution given matrix above to get a matrix of values for sample
+#size of 'n1'
+
+covarmat <- matrix(c(1,cov_er,cov_er, sigma_v), nrow = 2, ncol = 2)
+
+#we now need to get and separate our error terms
+
+evmat_n1 = mvrnorm(n = n1, mu = c(0,0), Sigma = covarmat, empirical = TRUE)
+
+#separate errors
+en1 = evmat_n1[,1]
+vn1 = evmat_n1[,2]
+
+#let's construct x's and y's and add them to our z's to create a full data matrix
+X = crossprod(z_n1, betas) + vn1
+Y = X + en1
+#full matrix
+
+znames = paste(rep("z", k), c(1:k), sep = "_")
+z = as.data.frame(z_n1)
+colnames(z) <- znames
+
+X = as.data.frame(X, names = "X")
+colnames(X) <- "X"
+
+Y = as.data.frame(Y, names = "Y")
+colnames(Y) <- "Y"
+
+product_n1<-cbind(z,X,Y)
+
+#Then, send the product for sample size n1 to the CSV designated
+```

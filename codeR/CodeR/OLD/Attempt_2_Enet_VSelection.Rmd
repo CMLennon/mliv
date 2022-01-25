@@ -1,0 +1,306 @@
+---
+title: "Attempt_2_ENet_VSelection"
+author: "Connor Lennon"
+date: "4/28/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Some notes about the simulation
+
+In general, it seems as if LASSO drops the entire model. It may be that the coefficients are too small, and that LASSO is designed to 'find the unknown gem' amongst the rest of the variable set, so to speak (and all of these variables are quite weak.) When I adjust the coefficients to be less weak, this problem disappears.
+
+The simulation itself is not anywhere near efficient. I'd love some feedback on ways to fix that, or what could be done to adapt this analysis to better suit our needs.
+
+```{r packages preload}
+#let's load up our toolkit  
+options(stringsAsFactors = F)
+  # Packages
+  library(pacman)
+p_unload(plotly)  
+p_load(
+    ggplot2, tidymodels, e1071, ggthemes, latex2exp, Cairo,
+    party, estimatr, lfe,
+    tidyverse, haven, data.table, lubridate, magrittr, parallel, parsnip, glmnet, doParallel
+  )
+```
+
+## Simulate the data
+
+This time, we need to test with a very large number of variables over a variety of lambdas. To do this, let's build a couple of working paramaters
+```{r pressure, echo=FALSE}
+#set simulation seed
+set.seed(42)
+
+#number of observations
+numb = 1000 
+
+#number of variables
+k = 500
+
+#number of parameters
+#set up names
+z_names = NULL
+X_names = NULL
+V_names = NULL
+for (h in 1:k) {
+  z_names[h] = paste0('z', as.character(h))
+  X_names[h] = paste0('X', as.character(h))
+  V_names[h] = paste0('V', as.character(h))
+}
+#generate data, set names
+
+# dataInitf <- as.tibble(dataInitf)
+  
+#generate a list of very small betas
+beta_max = .10
+beta_min = -.05
+beta_vals <- runif(k, beta_min, beta_max)
+
+#generate some subsample of variables (25% here) that will have a small effect on X. The remainder are just data noise.
+
+expow = NULL
+
+while (length(expow) < k){
+  set.seed(42 + length(expow)*2)
+  expow[length(expow)+1] = rbinom(n = 1,1, prob = .25)
+}
+
+#check size
+length(expow)
+
+#expowlog is a logical include/not include for z variables. Followed by falses to remove various non-z variables
+expowlog <- c(expow > 0, FALSE,FALSE,FALSE,FALSE,FALSE)
+length(expowlog)
+
+#before going into simulation, check for potential issues.
+warnings(ncol(dataInitf))
+itr <- function(numb=numb, iter = iter, k = k) {
+  
+  #empty dataset
+  dataInit = dataInitf = NULL
+  #initialize instruments, set names to 'z' syntax
+  dataInitf <- data.frame(
+  matrix(rnorm(numb*k), nrow = numb, ncol = k))
+  dataInitf <- dataInitf %>% rename_(.dots = setNames(X_names, z_names))
+  
+  #initialize constructed variables
+  dataInitf$e = 0
+  dataInitf$X = 0
+  dataInitf$Y = 0
+  dataInitf$X_noiseless = 0
+  dataInitf$X_clean = 0
+  for (n in 1:numb){
+    set.seed(42+n)
+    #build a common error term
+    dataInitf <- dataInitf %>%
+      mutate(e = sample(rnorm(10),1))
+    
+    dataInitf[n,]$X = sum(dataInitf[2,expowlog]*beta_vals[expowlog]) + sample(rnorm(15),1) + dataInitf$e[n]
+    dataInitf[n,]$Y = dataInitf[n,]$X + rnorm(1,0,sd = 3) + dataInitf[n,]$e
+    dataInitf[n,]$X_noiseless = sum(dataInitf[n,expowlog]*beta_vals[expowlog])
+    
+    #build in version of enet with no 'useless' coefficients
+    dataInitf[n,]$X_clean = sum(dataInitf[n,1:k]*beta_vals) + sample(rnorm(15),1) + dataInitf$e[n]
+  }
+  
+  #Now, we need to use cross-validation to determine our lambda for us
+  train_rows <- sample(1:numb, 2/3*numb)
+  z.Train <- dataInitf[train_rows,1:k]
+  z.Test <- dataInitf[-train_rows,1:k]
+  
+  x.Train<- dataInitf[train_rows,k+2]
+  x.Test <- dataInitf[-train_rows,k+2]
+  
+  #clean x fits
+  xc.Train<- dataInitf[train_rows,k+5]
+  xc.Test <- dataInitf[-train_rows,k+5]
+  #build list to store all alpha fits
+  list_of_fits <- NULL
+  list_of_fits_clean <- NULL
+  resolution = 25
+  alphafind <- tibble()
+  
+  #pseudo crossvalidate for elastic net alpha parameter. We need alpha to be small, as it often is the case that our model wants to drop all z's which isn't helpful for the simulation.
+  for (i in 0:resolution/10) {
+    fit_name <- paste0("alpha",i/resolution)
+    #now we need to build our list of fits. Note: cv.glmnet requires 'matrix' inputs
+    list_of_fits[[fit_name]] <-
+      cv.glmnet(x = as.matrix(z.Train), y = as.matrix(x.Train), type.measure = "mse", alpha = as.double(i/resolution), 
+                family ='gaussian', parallel = TRUE)
+    list_of_fits_clean[[fit_name]] <-
+           cv.glmnet(x = as.matrix(z.Train), y = as.matrix(xc.Train), type.measure = "mse", alpha = as.double(i/resolution), 
+                family ='gaussian', parallel = TRUE)
+  }
+  alphafind = tibble()
+  
+  #predict for each alpha, in order to optimize for our algorithm, we will predict for each alpha and then find our mse minimizing alpha/lambda
+  for (i in 0:resolution/10) {
+    fit_name2 <- paste0("alpha",i/resolution)
+    alpha_temp = i/resolution
+    predicts <- predict(list_of_fits[[fit_name2]], s = list_of_fits[[fit_name]]$lambda.min, newx = as.matrix(z.Test), alpha = alpha_temp)
+    predicts_clean <- predict(list_of_fits_clean[[fit_name2]], s = list_of_fits_clean[[fit_name]]$lambda.min, newx = as.matrix(z.Test), alpha = alpha_temp)
+    #record mse
+    mse <- sum((x.Test - predicts)^2)
+    mse_clean <- sum((x.Test - predicts_clean)^2)
+    
+    #store temporarily the level of alpha, calculated mse, fit name, and the optimal lambda associated to that level
+    temp <- tibble(alpha = i/resolution, mse = mse, mse_clean, fit.name = fit_name, list_of_fits[[fit_name]]$lambda.min, list_of_fits_clean[[fit_name]]$lambda.min)
+    alphafind <- rbind(alphafind, temp)
+  }
+
+
+#now use CV found alphas and lambdas to generate new data
+min.mse.alpha <- alphafind[alphafind$mse == min(alphafind$mse),]
+min.mse.alpha.clean <- alphafind[alphafind$mse_clean == min(alphafind$mse_clean),]
+
+#find our best outcome
+min.mse.alphacv <-
+  cv.glmnet(x = as.matrix(dataInitf[,1:k]), y = as.matrix(dataInitf[,k+2]), type.measure = "mse", alpha = min.mse.alpha$alpha, family ='gaussian', parallel = TRUE)
+min.mse.alphacv.clean <-
+  cv.glmnet(x = as.matrix(dataInitf[,1:k]), y = as.matrix(dataInitf[,k+2]), type.measure = "mse", alpha = min.mse.alpha.clean$alpha, family ='gaussian', parallel = TRUE)
+
+ridge <- cv.glmnet(as.matrix(dataInitf[,1:k]), as.matrix(dataInitf[,k+2]), type.measure = "mse", alpha = 0, family ='gaussian')
+
+ridge_clean <- cv.glmnet(as.matrix(dataInitf[,1:k]), as.matrix(dataInitf[,k+5]), type.measure = "mse", alpha = 0, family ='gaussian')
+
+lasso <- cv.glmnet(as.matrix(dataInitf[,1:k]), as.matrix(dataInitf[,k+2]), family = 'gaussian')
+
+lasso_clean <- cv.glmnet(as.matrix(dataInitf[,1:k]), as.matrix(dataInitf[,k+5]), family = 'gaussian')
+
+#predict our X from our optimal cv parameters
+predict_min_mse <- predict(min.mse.alphacv, s = min.mse.alphacv$lambda.min, newx = as.matrix(z.Test), type = 'link')
+
+#predict X across FULL dataset, test and training
+predict_full <- predict(min.mse.alphacv, s = min.mse.alphacv$lambda.min, newx = as.matrix(dataInitf[,1:k]), type = 'link')
+predict_full_clean <- predict(min.mse.alphacv.clean, s = min.mse.alphacv.clean$lambda.min, newx = as.matrix(dataInitf[,1:k]), type = 'link')
+
+#predict using ridge
+predict_ridge <- predict(ridge, s = min.mse.alphacv$lambda.min, newx = as.matrix(dataInitf[,1:k]), type = 'link')
+predict_ridge_clean <- predict(ridge_clean, s = min.mse.alphacv$lambda.min, newx = as.matrix(dataInitf[,1:k]), type = 'link')
+
+#predict using lasso
+predict_lasso <- predict(lasso, s = min.mse.alphacv$lambda.min, newx = as.matrix(dataInitf[,1:k]), type = 'link')
+predict_lasso_clean <- predict(lasso_clean, s = min.mse.alphacv$lambda.min, newx = as.matrix(dataInitf[,1:k]), type = 'link')
+
+#generate the ols estimation for X
+x1hatols <- predict(lm(data = dataInitf[1:numb,c(1:k,k+2)], X ~ .))
+x1hatolsclean <- predict(lm(data = dataInitf[1:numb,c(1:k,k+5)], X_clean ~ .))
+
+length(dataInitf$X_clean)
+
+#calculate our 'seen' MSE
+tradmse <- mean((predict_min_mse - dataInitf[-train_rows,]$X)^2)
+
+#calculate our 'unseen' MSE (ie, MSE ignoring noise terms) and de-meaning in case this is simply a result of circumstantially different means (we only have an issue if the variation in Y is in X-hat as well)
+noiselessmse <- mean(predict_min_mse - mean(predict_min_mse) - (dataInitf[-train_rows,]$X_noiseless-mean(dataInitf[-train_rows,]$X_noiseless))^2)
+
+#transfer data to data.table form.
+dataInit <- as.data.table(dataInitf)
+
+    bind_rows(
+      # OLS: DGP
+      lm(Y ~ X_noiseless, data = dataInitf) %>% tidy(quick = T) %>%
+        filter(grepl("X", term)) %>%
+        mutate(model = "Method: Best Possible Guess")%>% 
+        mutate(R = summary(lm(Y ~ X_noiseless, data = dataInitf))$R.squared),
+      # OLS: OVB
+      lm(Y ~ X, data = dataInitf) %>% tidy(quick = T) %>%
+        filter(grepl("X", term)) %>%
+        mutate(model = "Method: Naive")%>% 
+        mutate(R = summary(lm(Y ~ X, data = dataInitf))$R.squared),
+      # OLS: Clean
+      lm(Y ~ X_clean, data = dataInitf) %>% tidy(quick = T) %>%
+        filter(grepl("X", term)) %>%
+        mutate(model = "Method: Naive")%>% 
+        mutate(R = summary(lm(Y ~ X, data = dataInitf))$R.squared),
+      # Second stage: limited_enet
+      lm(Y ~ predict_full, data = dataInitf) %>% tidy(quick = T) %>%
+        filter(grepl("predict_full", term)) %>%
+        mutate(model = "Method: Elastic Net Selection")%>% 
+        mutate(R = summary(lm(Y ~ predict_full, data = dataInitf))$R.squared),
+      #Second stage: limited_enet, no irrelevant variables
+      lm(Y ~ predict_full_clean, data = dataInitf) %>% tidy(quick = T) %>%
+        filter(grepl("predict_full", term)) %>%
+        mutate(model = "Method: Elastic Net Selection")%>% 
+        mutate(R = summary(lm(Y ~ predict_full, data = dataInitf))$R.squared),
+      # #Second stage: Lasso
+      # lm(Y ~ predict_lasso, data = dataInitf) %>% tidy(quick = T) %>%
+      #   filter(grepl("predict_lasso", term)) %>%
+      #   mutate(model = "Method: Lasso") %>% 
+      #   mutate(R = summary(lm(Y ~ predict_lasso, data = dataInitf))$R.squared),
+      # #Second stage: Lasso Clean
+      # lm(Y ~ predict_lasso_clean, data = dataInitf) %>% tidy(quick = T) %>%
+      #   if_else(filter(grepl))
+      #   filter(grepl("predict_lasso_clean", term)) %>%
+      #   mutate(model = "Method: Lasso, no irrelevant variables") %>% 
+      #   mutate(R = summary(lm(Y ~ predict_lasso_clean, data = dataInitf))$R.squared),
+      #Second stage: Ridge
+      lm(Y ~ predict_ridge, data = dataInitf) %>% tidy(quick = T) %>%
+        filter(grepl("predict_ridge", term)) %>%
+        mutate(model = "Method: Ridge") %>% 
+        mutate(R = summary(lm(Y ~ predict_ridge, data = dataInitf))$R.squared),
+      #Second stage: Ridge Clean
+      lm(Y ~ predict_ridge_clean, data = dataInitf) %>% tidy(quick = T) %>%
+        filter(grepl("predict_ridge_clean", term)) %>%
+        mutate(model = "Method: Ridge, no irrelevant variables") %>% 
+        mutate(R = summary(lm(Y ~ predict_ridge_clean, data = dataInitf))$R.squared),
+      #ideally what would be guessed by our E-net selection
+      lm(Y ~ x1hatols, data = dataInitf) %>% tidy(quick = T) %>%
+        filter(grepl("x1", term)) %>%
+        mutate(model = "Method: OLS") %>% 
+        mutate(R = summary(lm(Y ~ x1hatols, data = dataInitf))$R.squared) %>% 
+        mutate(iter = iter) %>% data.table()
+    )
+}
+```
+
+```{r}
+# build a function to iterate through somemodels
+  run_sim <- function(n=numb, n_sims, n_cores = detectCores()-1, seed = 12345) {
+    # Set the seed
+    set.seed(seed)
+
+    mclapply(X = 1:n_sims, FUN = itr, n = n, k = k, mc.cores = n_cores-2) %>% rbindlist()
+  }
+
+  sim_dt <- run_sim(n = 1000, n_sims = 40)
+  sim_dt <- sim_dt %>% mutate(estimate = ifelse(is.na(estimate), 0,estimate))
+  sim_dt
+```
+
+**GENERAL OBSERVATIONS**
+
+Some general observations: right now the lasso penalty (restricting variables) is dropping every variable in the model (probably due to small coefficient size.) However, the ridge penalty which doesn't allow variable dropping doesn't restrict the coefficient size to 0 in all cases. Thus, the elastic net penalty can't feature an alpha that's too high because otherwise it will mimic the lasso and choose to drop (at more benefit to the modified cost function - the ridge makes this more attractive since you buy a gamma*X gain on the loss function) all variables. Generally the ridge regression approach only magnifies preexisting bias, meaning if you have a weak instruments problem already, you won't avoid it by using an off-the-shelf method (this shrinks coefficients and thus in fact amplifies the problem.)
+
+
+```{r}
+  ggplot(
+    data = sim_dt %>% filter(grepl("Method", model)),
+    aes(x = estimate, fill = model)
+  ) +
+  geom_density(color = NA, alpha = 0.65) +
+  theme_pander() +
+  scale_fill_viridis_d("Model", option = "A") +
+  xlab("Beta estimate distribution across models")
+
+  ggplot(
+    data = sim_dt %>% filter(grepl("Method", model)),
+    aes(x = model, y = R, fill = model)
+  ) +
+  geom_bar(color = NA, alpha = 0.65) +
+  theme_pander() +
+  scale_fill_viridis_d("Model", begin = 0, end = 1, option = "B") +
+  xlab("R-squared across all model types")
+```
+
+
+
+```{r}
+#testing codeblock, NOT RUN.
+itr(iter = 1, numb = numb, k = 500)
+```
+
